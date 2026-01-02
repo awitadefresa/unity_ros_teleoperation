@@ -9,7 +9,6 @@ using RosMessageTypes.Std;
 using Unity.Robotics.ROSTCPConnector.ROSGeometry;
 using TMPro;
 
-
 public class HeadsetPublisher : MonoBehaviour
 {
     public string unityFrame = "vr_origin";
@@ -36,7 +35,7 @@ public class HeadsetPublisher : MonoBehaviour
     private HeaderMsg headsetHeader;
     private HeaderMsg odomHeader;
 
-    private string rootFrame;
+    private string rootFrame = "odom";
     private int _decimator = 1;
     private int _frameCounter = 0;
 
@@ -46,17 +45,33 @@ public class HeadsetPublisher : MonoBehaviour
 
         handFrameRight = handFrameLeft.Replace("left", "right");
 
-        root = GameObject.FindWithTag("root").transform;
-        if (root == null)
+        // Safe root lookup (no crash if tag is missing)
+        GameObject rootGo = GameObject.FindWithTag("root");
+        if (rootGo == null)
         {
-            Debug.LogError("Root not found");
-            rootFrame = "odom"; // default to odom if no root is found
+            Debug.LogWarning("[HeadsetPublisher] Root with tag 'root' not found. Using rootFrame='odom' and identity transform.");
+            root = null;
+            rootFrame = "odom";
         }
-        else 
-            rootFrame = root.GetComponent<TFAttachment>().FrameID;
+        else
+        {
+            root = rootGo.transform;
+            var tfAttach = root.GetComponent<TFAttachment>();
+            if (tfAttach != null && !string.IsNullOrEmpty(tfAttach.FrameID))
+                rootFrame = tfAttach.FrameID;
+            else
+                rootFrame = "odom";
+        }
 
-        ros.RegisterPublisher<PoseStampedMsg>(poseTopic+"/headset");
+        // Enable actions if present (prevents some Android cases)
+        EnableIfValid(headsetPose);
+        EnableIfValid(headsetRotation);
+        EnableIfValid(handPoseLeft);
+        EnableIfValid(handRotationLeft);
+        EnableIfValid(handPoseRight);
+        EnableIfValid(handRotationRight);
 
+        ros.RegisterPublisher<PoseStampedMsg>(poseTopic + "/headset");
         ros.RegisterPublisher<TFMessageMsg>("/tf");
 
         headsetPoseMsg = new PoseStampedMsg();
@@ -69,37 +84,62 @@ public class HeadsetPublisher : MonoBehaviour
         odomHeader = new HeaderMsg();
         odomHeader.frame_id = rootFrame;
 
-        tfMsg = new TFMessageMsg(); 
+        tfMsg = new TFMessageMsg();
 
-        decimatorText.text = "TF Decimator: " + _decimator;
+        if (decimatorText != null)
+            decimatorText.text = "TF Decimator: " + _decimator;
+    }
 
+    private void EnableIfValid(InputActionReference a)
+    {
+        if (a != null && a.action != null)
+            a.action.Enable();
     }
 
     void Update()
     {
-        // For better performance we can choose to only publish every nth frame
+        // Publish every nth frame
         _frameCounter++;
         if (_frameCounter % _decimator != 0)
             return;
-
         _frameCounter = 0;
 
+        // If any required action is missing, do nothing (no crash)
+        if (headsetPose == null || headsetPose.action == null ||
+            headsetRotation == null || headsetRotation.action == null ||
+            handPoseLeft == null || handPoseLeft.action == null ||
+            handRotationLeft == null || handRotationLeft.action == null ||
+            handPoseRight == null || handPoseRight.action == null ||
+            handRotationRight == null || handRotationRight.action == null)
+        {
+            return;
+        }
 
-        // TF publishing (preferred means of poses, but sometimes weird with timing)
+        // TF message (odom -> vr_origin, then headset/hands under vr_origin)
         tfMsg.transforms = new TransformStampedMsg[4];
+
+        // 0) root -> unityFrame
         tfMsg.transforms[0] = new TransformStampedMsg();
         HeaderMsg rootHeader = new HeaderMsg();
         rootHeader.frame_id = rootFrame;
-        // Publish the pose from odom to unity center
         tfMsg.transforms[0].header = rootHeader;
         tfMsg.transforms[0].child_frame_id = unityFrame;
         tfMsg.transforms[0].transform = new TransformMsg();
         tfMsg.transforms[0].transform.translation = new Vector3Msg();
         tfMsg.transforms[0].transform.rotation = new QuaternionMsg();
-        tfMsg.transforms[0].transform.translation = root.InverseTransformPoint(Vector3.zero).To<FLU>();
-        tfMsg.transforms[0].transform.rotation = Quaternion.Inverse(root.rotation).To<FLU>();
 
-        // Publish the headset to unity center
+        if (root != null)
+        {
+            tfMsg.transforms[0].transform.translation = root.InverseTransformPoint(Vector3.zero).To<FLU>();
+            tfMsg.transforms[0].transform.rotation = Quaternion.Inverse(root.rotation).To<FLU>();
+        }
+        else
+        {
+            tfMsg.transforms[0].transform.translation = Vector3.zero.To<FLU>();
+            tfMsg.transforms[0].transform.rotation = Quaternion.identity.To<FLU>();
+        }
+
+        // 1) unityFrame -> headset
         tfMsg.transforms[1] = new TransformStampedMsg();
         tfMsg.transforms[1].header = headsetHeader;
         tfMsg.transforms[1].child_frame_id = headsetFrame;
@@ -108,25 +148,22 @@ public class HeadsetPublisher : MonoBehaviour
         tfMsg.transforms[1].transform.rotation = new QuaternionMsg();
         tfMsg.transforms[1].transform.rotation.w = 1;
 
-        // Publish the left hand to unity center
+        // 2) unityFrame -> left hand
         tfMsg.transforms[2] = new TransformStampedMsg();
         tfMsg.transforms[2].header = headsetHeader;
         tfMsg.transforms[2].child_frame_id = handFrameLeft;
         tfMsg.transforms[2].transform = new TransformMsg();
 
-        // Publish the right hand to unity center
+        // 3) unityFrame -> right hand
         tfMsg.transforms[3] = new TransformStampedMsg();
         tfMsg.transforms[3].header = headsetHeader;
         tfMsg.transforms[3].child_frame_id = handFrameRight;
         tfMsg.transforms[3].transform = new TransformMsg();
 
-
-
+        // Read headset pose/rotation from InputActions (this is what can stay at 0 on Quest)
         QuaternionMsg quaternion = headsetRotation.action.ReadValue<Quaternion>().To<FLU>();
-
-        if(quaternion.From<FLU>().Equals(default))
+        if (quaternion.From<FLU>().Equals(default))
             quaternion.w = 1;
-
 
         tfMsg.transforms[1].transform.translation = headsetPose.action.ReadValue<Vector3>().To<FLU>();
         tfMsg.transforms[1].transform.rotation = quaternion;
@@ -137,21 +174,26 @@ public class HeadsetPublisher : MonoBehaviour
         tfMsg.transforms[3].transform.translation = handPoseRight.action.ReadValue<Vector3>().To<FLU>();
         tfMsg.transforms[3].transform.rotation = handRotationRight.action.ReadValue<Quaternion>().To<FLU>();
 
-        // Unity defaults to a quaternion with all 0s if the headset/hands arent detected, if this happens we set the identity quaternion
-        for(int i = 0; i < tfMsg.transforms.Length; i++)
+        // Fix default quaternions
+        for (int i = 0; i < tfMsg.transforms.Length; i++)
+        {
             if (tfMsg.transforms[i].transform.rotation.From<FLU>().Equals(default))
                 tfMsg.transforms[i].transform.rotation.w = 1;
+        }
 
+        // PoseStamped headset
         headsetPoseMsg.pose.position = headsetPose.action.ReadValue<Vector3>().To<FLU>();
         headsetPoseMsg.pose.orientation = quaternion;
-        ros.Publish(poseTopic+"/headset", headsetPoseMsg);
 
+        // Publish (ROSConnection exists even if no ROS master; it won't NRE)
+        ros.Publish(poseTopic + "/headset", headsetPoseMsg);
         ros.Publish("/tf", tfMsg);
     }
 
     public void OnDecimatorChange(float value)
     {
         _decimator = (int)value;
-        decimatorText.text = "TF Decimator: " + _decimator;
+        if (decimatorText != null)
+            decimatorText.text = "TF Decimator: " + _decimator;
     }
 }
